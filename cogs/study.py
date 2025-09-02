@@ -43,13 +43,15 @@ def slugify(course: str) -> str:
     return re.sub(r'[^A-Z0-9]+', '-', course.upper()).strip('-')[:80]
 
 # ---------- UI components ----------
-class CourseButton(discord.ui.Button):
-    def __init__(self, cog: "Study", message_id: int, course: str):
+class VolunteerButton(discord.ui.Button):
+    def __init__(self, cog: "Study", message_id: int, course: str, professor: str):
         self.cog = cog
         self.message_id = message_id
         self.course = course
         cid = f"tt;{message_id};{slugify(course)}"
-        super().__init__(label="I can help", style=discord.ButtonStyle.primary, custom_id=cid)
+        label_text = f"{course}" + (f" ({professor})" if professor else "")
+
+        super().__init__(label=label_text, style=discord.ButtonStyle.primary, custom_id=cid)
 
     async def callback(self, interaction: discord.Interaction):
         sess = self.cog.sessions.get(self.message_id)
@@ -63,7 +65,7 @@ class CourseButton(discord.ui.Button):
         uid = str(interaction.user.id)
         if uid in c["volunteers"]:
             c["volunteers"].remove(uid)
-            msg = "Removed you from this course."
+            msg = "Removed you as a tutor from this course."
         else:
             c["volunteers"].append(uid)
             msg = "Added you as a tutor for this course."
@@ -77,10 +79,10 @@ class CourseButton(discord.ui.Button):
             pass
 
 class CourseView(discord.ui.View):
-    def __init__(self, cog: "Study", message_id: int, courses: List[str]):
+    def __init__(self, cog: "Study", message_id: int, courses: dict):
         super().__init__(timeout=None)  # (persistence to be added later)
-        for course in courses[:MAX_COURSES]:
-            self.add_item(CourseButton(cog, message_id, course))
+        for course_name in list(courses.keys())[:MAX_COURSES]:
+            self.add_item(VolunteerButton(cog, message_id, course_name, courses[course_name]["professor"]))
 
 class PreviewView(discord.ui.View):
     def __init__(self, cog: "Study", token: str):
@@ -96,7 +98,6 @@ class PreviewView(discord.ui.View):
             return
         # Send the real message first (no view) to get message_id
         embed = self.cog.build_embed({"announcement": data["announcement"],
-                                      "footer": data["footer"],
                                       "courses": data["courses"]}, guild=None)
         msg = await interaction.channel.send(embed=embed)
         # Save session in-memory
@@ -105,12 +106,11 @@ class PreviewView(discord.ui.View):
             "channel_id": str(msg.channel.id),
             "guild_id": str(msg.guild.id) if msg.guild else "",
             "announcement": data["announcement"],
-            "footer": data["footer"],
             "courses": data["courses"],  # already includes volunteers arrays
         }
         self.cog.sessions[msg.id] = session
         # Attach buttons per course
-        view = CourseView(self.cog, msg.id, list(session["courses"].keys()))
+        view = CourseView(self.cog, msg.id, dict(session["courses"]))
         await msg.edit(view=view)
         # Ack to the poster
         await interaction.response.send_message(f"Posted! Jump: {msg.jump_url}", ephemeral=True)
@@ -125,8 +125,7 @@ class PreviewView(discord.ui.View):
             return
         await interaction.response.send_modal(StudySetupModal(self.cog,
                                                               announcement_default=data["announcement"],
-                                                              courses_default=data["raw_courses"],
-                                                              footer_default=data["footer"]))
+                                                              courses_default=data["raw_courses"]))
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, _button: discord.ui.Button):
@@ -136,40 +135,30 @@ class PreviewView(discord.ui.View):
 # ---------- Modal ----------
 class StudySetupModal(discord.ui.Modal):
     def __init__(self, cog: "Study",
-                 *, announcement_default: str = "", courses_default: str = "", footer_default: str = ""):
+                 *, announcement_default: str = "", courses_default: str = ""):
         super().__init__(title="Study Tables Setup")
         self.cog = cog
 
         # safe defaults
         announcement_default = (announcement_default or "").strip()[:500]
         courses_default = (courses_default or "").strip()[:3500]
-        footer_default = (footer_default or "").strip()[:500]
 
         self.session_announcement_input = discord.ui.TextInput(
             label="Study Tables Announcement",
             style=discord.TextStyle.paragraph,
-            default=announcement_default or "Study Tables will be held on {date} at {place}.",
+            default=announcement_default or "Study Tables will be held on {date} at {place}.\n\nBrothers need help with the courses listed below.\nIf you are able to tutor during Study Tables, please click the corresponding toggle button.\n\nIf you requested help, find a brother that is listed as a tutor for your course during Study Tables.",
             required=True, max_length=500,
         )
         self.courses_input = discord.ui.TextInput(
-            label="Courses (blocks format)",
+            label="Courses (MUST FOLLOW THIS EXACT FORMAT)",
             style=discord.TextStyle.paragraph,
             default=courses_default or
             "MECH-241 | Prof: Dr. Smith\nAssignment 1\nQuiz 2\n\nCHEM-132\nReaction rates",
             required=True, max_length=3500,
         )
-        self.footer_message_input = discord.ui.TextInput(
-            label="Footer Message",
-            style=discord.TextStyle.paragraph,
-            default=footer_default or
-            "Please mark if you can help during this session of Study Tables.\n\n"
-            "If you requested help, find an available tutor for your course.",
-            required=False, max_length=500,
-        )
 
         self.add_item(self.session_announcement_input)
         self.add_item(self.courses_input)
-        self.add_item(self.footer_message_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         # Parse courses
@@ -187,14 +176,12 @@ class StudySetupModal(discord.ui.Modal):
             "user_id": interaction.user.id,
             "channel_id": interaction.channel.id if interaction.channel else None,
             "announcement": self.session_announcement_input.value.strip(),
-            "footer": self.footer_message_input.value.strip(),
             "courses": courses,
             "raw_courses": self.courses_input.value.strip(),
         }
 
         embed = self.cog.build_embed({
             "announcement": self.session_announcement_input.value.strip(),
-            "footer": self.footer_message_input.value.strip(),
             "courses": courses
         }, guild=None)
 
@@ -214,8 +201,17 @@ class Study(commands.Cog):
 
     def build_embed(self, session: Dict, guild: discord.Guild | None) -> discord.Embed:
         """Render the announcement + courses + current volunteers into an embed."""
-        embed = discord.Embed(title="Study Tables Preparation", description=session["announcement"])
-        for course, data in session["courses"].items():
+
+        EQUALS_SEP = "=" * 30     # U+FF0A FULLWIDTH ASTERISK
+        DASH_SEP = "-" * 30     # U+2500 BOX DRAWINGS LIGHT HORIZONTAL
+
+        description = session.get("announcement", "").strip() + f"\n\n{EQUALS_SEP}"
+        embed = discord.Embed(title="Study Tables Preparation", description=description)
+
+        for i in range(len(session["courses"].items())):
+            course_name = list(session["courses"].keys())[i]
+            data = session["courses"][course_name]
+
             prof = data.get("professor") or ""
             topics = data.get("desc") or []
             vols = data.get("volunteers") or []
@@ -227,17 +223,20 @@ class Study(commands.Cog):
                 tutors = "\n".join(names) if names else "—"
             else:
                 tutors = "—"
-            bullet = "\n".join(f"• {t}" for t in topics) if topics else "_(no specific topics)_"
-            name = f"{course}" + (f" — Prof. {prof}" if prof else "")
+            bullet = "\n".join(f"• {t}" for t in topics) if topics else "_(no specific topics requested)_"
+            name = f"{course_name}" + (f" — {prof}" if prof else "")
+
             value = f"{bullet}\n\n**Tutors:**\n{tutors}"
+            if (i == len(session["courses"].items()) - 1):
+                value += f"\n\n{EQUALS_SEP}"
+            else:
+                value += f"\n\n{DASH_SEP}"
+            
             embed.add_field(name=name, value=value, inline=False)
 
-        footer = (session.get("footer") or "").strip()
-        if footer:
-            embed.set_footer(text=footer[:2000])
         return embed
 
-    @app_commands.command(name="setup", description="Open the Study Tables setup modal")
+    @app_commands.command(name="tutoring", description="Open the Study Tables setup modal")
     @app_commands.guilds(_GUILD) if _GUILD else (lambda f: f)
     async def study_setup(self, interaction: discord.Interaction):
         await interaction.response.send_modal(StudySetupModal(self))
