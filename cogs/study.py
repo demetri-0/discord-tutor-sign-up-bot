@@ -3,6 +3,8 @@ from typing import Dict, List
 import discord
 from discord import app_commands
 from discord.ext import commands
+import json
+from pathlib import Path
 
 _GUILD_ID = os.getenv("GUILD_ID")
 _GUILD = discord.Object(id=int(_GUILD_ID)) if (_GUILD_ID and _GUILD_ID.isdigit()) else None
@@ -71,6 +73,7 @@ class VolunteerButton(discord.ui.Button):
             msg = "Added you as a tutor for this course."
         # Confirm to the clicker
         await interaction.response.send_message(msg, ephemeral=True)
+        self.cog._save_sessions()
         # Refresh the posted message
         embed = self.cog.build_embed(sess, guild=interaction.guild)
         try:
@@ -109,6 +112,7 @@ class PreviewView(discord.ui.View):
             "courses": data["courses"],  # already includes volunteers arrays
         }
         self.cog.sessions[msg.id] = session
+        self.cog._save_sessions()
         # Attach buttons per course
         view = CourseView(self.cog, msg.id, dict(session["courses"]))
         await msg.edit(view=view)
@@ -193,11 +197,37 @@ class StudySetupModal(discord.ui.Modal):
         )
 
 # ---------- Cog ----------
+DATA_PATH = Path("data/sessions.json")
+
 class Study(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.sessions: Dict[int, Dict] = {}   # message_id -> session (in-memory for now)
         self.previews: Dict[str, Dict] = {}   # token -> preview data
+        self._reattached = False
+        self._load_sessions()
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        await self.reattach_persistent_views()
+
+    def _load_sessions(self):
+        if DATA_PATH.exists():
+            try:
+                raw = json.load(DATA_PATH.open("r", encoding="utf-8"))
+                # file stores keys as strings; convert to ints in-memory
+                self.sessions = {int(k): v for k, v in (raw.get("sessions") or {}).items()}
+            except Exception:
+                self.sessions = {}
+        else:
+            self.sessions = {}
+
+    def _save_sessions(self):
+        # store keys as strings for JSON
+        serializable = {"sessions": {str(k): v for k, v in self.sessions.items()}}
+        DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with DATA_PATH.open("w", encoding="utf-8") as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
 
     def build_embed(self, session: Dict, guild: discord.Guild | None) -> discord.Embed:
         """Render the announcement + courses + current volunteers into an embed."""
@@ -235,6 +265,19 @@ class Study(commands.Cog):
             embed.add_field(name=name, value=value, inline=False)
 
         return embed
+    
+    async def reattach_persistent_views(self):
+        if self._reattached:
+            return
+        # Recreate a persistent view for each saved message/session
+        for message_id, sess in self.sessions.items():
+            courses = dict(sess.get("courses", {}))
+            if not courses:
+                continue
+            view = CourseView(self, message_id, courses)
+            # This attaches the view to existing messages by custom_id (no fetch needed)
+            self.bot.add_view(view)
+        self._reattached = True
 
     @app_commands.command(name="tutoring", description="Open the Study Tables setup modal")
     @app_commands.guilds(_GUILD) if _GUILD else (lambda f: f)
